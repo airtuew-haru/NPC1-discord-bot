@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: sammy-discord-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: AI_MODEL
+        value: openai/gpt-oss-120b
+      - key: AI_MAX_TOKENS
+        value: "700"
+      - key: AI_HISTORY_LIMIT
+        value: "12"
+      - key: LOG_LEVEL
+        value: INFO
