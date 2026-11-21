@@ -13,27 +13,61 @@ from discord.ext import commands
 log = logging.getLogger(__name__)
 
 
-async def send_interaction_error(
+# ==================================================
+# Interaction helpers
+# ==================================================
+
+async def defer_interaction(
     interaction: discord.Interaction,
-    message: str,
 ) -> None:
-    """Safely send an ephemeral interaction error."""
+    """Defer an interaction before performing slow operations."""
+    if not interaction.response.is_done():
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+
+async def send_interaction_message(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    *,
+    embed: discord.Embed | None = None,
+) -> None:
+    """Send a response whether the interaction was deferred or not."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(
-                message,
+                content=content,
+                embed=embed,
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                message,
+                content=content,
+                embed=embed,
                 ephemeral=True,
             )
     except discord.HTTPException:
-        log.exception("Failed to send interaction error response")
+        log.exception("Failed to send interaction response")
 
+
+async def send_interaction_error(
+    interaction: discord.Interaction,
+    message: str,
+) -> None:
+    await send_interaction_message(
+        interaction,
+        message,
+    )
+
+
+# ==================================================
+# AI personality modal
+# ==================================================
 
 class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
+
     prompt = discord.ui.TextInput(
         label="System prompt / personality",
         style=discord.TextStyle.paragraph,
@@ -49,6 +83,7 @@ class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
         self,
         interaction: discord.Interaction,
     ) -> None:
+
         if interaction.guild is None:
             await send_interaction_error(
                 interaction,
@@ -66,14 +101,16 @@ class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
             return
 
         try:
+            await defer_interaction(interaction)
+
             await interaction.client.db.update_guild_settings(
                 interaction.guild.id,
                 ai_prompt=prompt_text,
             )
 
-            await interaction.response.send_message(
+            await send_interaction_message(
+                interaction,
                 "AI personality saved.",
-                ephemeral=True,
             )
 
         except Exception:
@@ -85,7 +122,12 @@ class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
             )
 
 
+# ==================================================
+# AI Cog
+# ==================================================
+
 class AIChat(commands.Cog):
+
     ai = app_commands.Group(
         name="ai",
         description="Configure the AI auto-reply assistant",
@@ -93,6 +135,7 @@ class AIChat(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
         self.channel_locks: defaultdict[int, asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
@@ -106,7 +149,7 @@ class AIChat(commands.Cog):
         description="Set the channel where the AI replies",
     )
     @app_commands.describe(
-        channel_id="Paste the channel ID or channel mention, e.g. <#123456789>"
+        channel_id="Paste the channel ID or channel mention"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
@@ -115,6 +158,7 @@ class AIChat(commands.Cog):
         interaction: discord.Interaction,
         channel_id: str,
     ) -> None:
+
         guild = interaction.guild
 
         if guild is None:
@@ -124,28 +168,21 @@ class AIChat(commands.Cog):
             )
             return
 
-        # Extract the numeric ID from either an ID or <#ID>.
         match = re.search(r"\d{15,25}", channel_id)
 
         if match is None:
             await send_interaction_error(
                 interaction,
-                "Invalid channel ID. Please copy the channel ID again.",
+                "Invalid channel ID.",
             )
             return
 
         target_id = int(match.group())
 
         try:
-            # Fetch directly from Discord instead of relying on cache conversion.
-            channel = await guild.fetch_channel(target_id)
+            await defer_interaction(interaction)
 
-            if channel.guild.id != guild.id:
-                await send_interaction_error(
-                    interaction,
-                    "That channel does not belong to this server.",
-                )
-                return
+            channel = await guild.fetch_channel(target_id)
 
             if not isinstance(channel, discord.TextChannel):
                 await send_interaction_error(
@@ -157,21 +194,23 @@ class AIChat(commands.Cog):
             bot_member = guild.me
 
             if bot_member is None:
-                bot_member = await guild.fetch_member(self.bot.user.id)
+                bot_member = await guild.fetch_member(
+                    self.bot.user.id
+                )
 
             permissions = channel.permissions_for(bot_member)
 
             if not permissions.view_channel:
                 await send_interaction_error(
                     interaction,
-                    "The bot cannot view that channel. Grant View Channel permission.",
+                    "The bot cannot view that channel.",
                 )
                 return
 
             if not permissions.send_messages:
                 await send_interaction_error(
                     interaction,
-                    "The bot cannot send messages there. Grant Send Messages permission.",
+                    "The bot cannot send messages in that channel.",
                 )
                 return
 
@@ -180,9 +219,9 @@ class AIChat(commands.Cog):
                 ai_channel_id=channel.id,
             )
 
-            await interaction.response.send_message(
+            await send_interaction_message(
+                interaction,
                 f"AI auto-replies are now configured for {channel.mention}.",
-                ephemeral=True,
             )
 
             log.info(
@@ -225,15 +264,18 @@ class AIChat(commands.Cog):
         self,
         interaction: discord.Interaction,
     ) -> None:
+
         try:
+            await defer_interaction(interaction)
+
             await self.bot.db.update_guild_settings(
                 interaction.guild.id,
                 ai_channel_id=None,
             )
 
-            await interaction.response.send_message(
+            await send_interaction_message(
+                interaction,
                 "AI auto-replies are disabled.",
-                ephemeral=True,
             )
 
             log.info(
@@ -250,7 +292,7 @@ class AIChat(commands.Cog):
             )
 
     # --------------------------------------------------
-    # Configure AI personality
+    # AI personality
     # --------------------------------------------------
 
     @ai.command(
@@ -263,7 +305,9 @@ class AIChat(commands.Cog):
         self,
         interaction: discord.Interaction,
     ) -> None:
+
         try:
+            # Modal must be the first response.
             settings = await self.bot.db.get_guild_settings(
                 interaction.guild.id
             )
@@ -283,7 +327,7 @@ class AIChat(commands.Cog):
             )
 
     # --------------------------------------------------
-    # Show AI status
+    # AI status
     # --------------------------------------------------
 
     @ai.command(
@@ -296,7 +340,10 @@ class AIChat(commands.Cog):
         self,
         interaction: discord.Interaction,
     ) -> None:
+
         try:
+            await defer_interaction(interaction)
+
             settings = await self.bot.db.get_guild_settings(
                 interaction.guild.id
             )
@@ -305,9 +352,10 @@ class AIChat(commands.Cog):
 
             if channel_id:
                 channel = interaction.guild.get_channel(channel_id)
+
                 channel_display = (
                     channel.mention
-                    if channel is not None
+                    if channel
                     else f"<#{channel_id}>"
                 )
             else:
@@ -351,9 +399,9 @@ class AIChat(commands.Cog):
                 inline=False,
             )
 
-            await interaction.response.send_message(
+            await send_interaction_message(
+                interaction,
                 embed=embed,
-                ephemeral=True,
             )
 
         except Exception:
@@ -365,7 +413,7 @@ class AIChat(commands.Cog):
             )
 
     # --------------------------------------------------
-    # Clear conversation history
+    # Clear history
     # --------------------------------------------------
 
     @ai.command(
@@ -378,15 +426,18 @@ class AIChat(commands.Cog):
         self,
         interaction: discord.Interaction,
     ) -> None:
+
         try:
+            await defer_interaction(interaction)
+
             await self.bot.db.clear_ai_history(
                 interaction.guild.id,
                 interaction.channel_id,
             )
 
-            await interaction.response.send_message(
+            await send_interaction_message(
+                interaction,
                 "AI conversation history cleared for this channel.",
-                ephemeral=True,
             )
 
         except Exception:
@@ -407,7 +458,6 @@ class AIChat(commands.Cog):
         message: discord.Message,
     ) -> None:
 
-        # Ignore DMs, bots and empty messages.
         if (
             message.guild is None
             or message.author.bot
@@ -416,7 +466,6 @@ class AIChat(commands.Cog):
         ):
             return
 
-        # Only process normal text channels.
         if not isinstance(message.channel, discord.TextChannel):
             return
 
@@ -435,7 +484,7 @@ class AIChat(commands.Cog):
 
             if self.bot.ai_client is None:
                 log.error(
-                    "AI channel is enabled but AI_API_KEY is missing."
+                    "AI is enabled but AI_API_KEY is missing."
                 )
                 return
 
@@ -449,8 +498,10 @@ class AIChat(commands.Cog):
 
                 system_prompt = (
                     settings.get("ai_prompt")
-                    or "You are a helpful Discord server assistant. "
-                       "Reply clearly and politely."
+                    or (
+                        "You are a helpful Discord server assistant. "
+                        "Reply clearly and politely."
+                    )
                 )
 
                 messages = [
@@ -470,6 +521,7 @@ class AIChat(commands.Cog):
                 )
 
                 async with message.channel.typing():
+
                     completion = (
                         await self.bot.ai_client.chat.completions.create(
                             model=self.bot.ai_model,
@@ -487,7 +539,6 @@ class AIChat(commands.Cog):
                         "I could not generate a response. Please try again."
                     )
 
-                # Save conversation history.
                 await self.bot.db.add_ai_history(
                     message.guild.id,
                     message.channel.id,
@@ -502,7 +553,6 @@ class AIChat(commands.Cog):
                     answer[:6000],
                 )
 
-                # Discord messages must stay below 2000 characters.
                 chunks = [
                     answer[index:index + 1900]
                     for index in range(0, len(answer), 1900)
@@ -541,6 +591,10 @@ class AIChat(commands.Cog):
             except discord.HTTPException:
                 log.exception("Failed to send AI error message")
 
+
+# ==================================================
+# Extension setup
+# ==================================================
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AIChat(bot))
