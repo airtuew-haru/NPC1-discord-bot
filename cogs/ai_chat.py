@@ -13,24 +13,38 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-# Vision model：只在訊息包含圖片時使用
-DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
+VISION_MODEL = os.getenv(
+    "AI_VISION_MODEL",
+    "qwen/qwen3.8-27b",
+).strip()
 
-# 圖片限制
-MAX_IMAGE_COUNT = 3
+MAX_IMAGES = 3
 MAX_IMAGE_SIZE = 6 * 1024 * 1024
 MAX_TOTAL_IMAGE_SIZE = 12 * 1024 * 1024
+MAX_HISTORY_TEXT = 5000
 
-SUPPORTED_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-}
+VISION_INSTRUCTIONS = """
+You are an image analysis component.
+
+Your task is to describe only what is visibly supported by the image.
+
+Rules:
+1. Describe the visible objects, characters, colors, clothing,
+   positions, expressions, and background.
+2. Do not invent names, identities, relationships, or events.
+3. Do not claim that an image is upside down unless there is
+   clear visual evidence.
+4. If something is unclear, explicitly say that it is uncertain.
+5. For anime illustrations, describe visible character features
+   rather than guessing the character's identity.
+6. Do not roleplay or use a fictional personality.
+7. Reply in Traditional Chinese.
+8. Keep the description concise but useful.
+"""
 
 
 def detect_image_mime(data: bytes) -> str | None:
-    """根據檔案內容判斷圖片格式，避免只相信副檔名。"""
+    """Detect supported image types from file signatures."""
 
     if data.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
@@ -56,32 +70,27 @@ def is_image_attachment(
 
     return (
         content_type.startswith("image/")
-        or any(filename.endswith(ext) for ext in SUPPORTED_EXTENSIONS)
-        or filename.endswith(".gif")
+        or filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
     )
 
 
-async def build_image_content(
+async def prepare_images(
     attachments: list[discord.Attachment],
-) -> tuple[list[dict], list[str]]:
-    """
-    下載 Discord 圖片附件，轉換成 Base64 Data URL，
-    供 Vision 模型讀取。
-    """
+) -> list[dict]:
+    """Download and encode Discord image attachments."""
 
-    if len(attachments) > MAX_IMAGE_COUNT:
+    if len(attachments) > MAX_IMAGES:
         raise ValueError(
-            f"You can send up to {MAX_IMAGE_COUNT} images at once."
+            f"You can send up to {MAX_IMAGES} images at once."
         )
 
-    image_parts = []
-    filenames = []
     total_size = 0
+    image_parts = []
 
     for attachment in attachments:
         if attachment.size > MAX_IMAGE_SIZE:
             raise ValueError(
-                f"{attachment.filename} is larger than 6 MB."
+                f"{attachment.filename} exceeds the 6 MB image limit."
             )
 
         total_size += attachment.size
@@ -95,7 +104,7 @@ async def build_image_content(
 
         if len(data) > MAX_IMAGE_SIZE:
             raise ValueError(
-                f"{attachment.filename} is larger than 6 MB."
+                f"{attachment.filename} exceeds the 6 MB image limit."
             )
 
         mime_type = detect_image_mime(data)
@@ -103,26 +112,22 @@ async def build_image_content(
         if mime_type is None:
             raise ValueError(
                 f"{attachment.filename} is not a supported image. "
-                "Use JPG, PNG, or WEBP."
+                "Please use JPG, PNG, or WEBP."
             )
 
         encoded = base64.b64encode(data).decode("ascii")
-
-        data_url = f"data:{mime_type};base64,{encoded}"
 
         image_parts.append(
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": data_url,
+                    "url": f"data:{mime_type};base64,{encoded}",
                     "detail": "auto",
                 },
             }
         )
 
-        filenames.append(attachment.filename)
-
-    return image_parts, filenames
+    return image_parts
 
 
 class AIPromptModal(
@@ -181,7 +186,7 @@ class AIPromptModal(
             log.exception("Could not save AI personality")
 
             await interaction.followup.send(
-                "Could not save the AI personality.",
+                "Could not save AI personality.",
                 ephemeral=True,
             )
 
@@ -195,65 +200,37 @@ class AIChat(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+        # Prevent simultaneous requests from mixing channel history.
         self.channel_locks: defaultdict[int, asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
 
-        self.vision_model = os.getenv(
-            "AI_VISION_MODEL",
-            DEFAULT_VISION_MODEL,
-        ).strip()
-
     @ai.command(
         name="set-channel",
-        description="Set the channel where the AI automatically replies",
+        description="Set the channel where the AI replies to every human message",
     )
     @app_commands.describe(
-        channel="Enter a text channel mention or channel ID"
+        channel="The text channel monitored by the AI"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def set_channel(
         self,
         interaction: discord.Interaction,
-        channel: str,
+        channel: discord.TextChannel,
     ) -> None:
-
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This command can only be used in a server.",
-                ephemeral=True,
-            )
-            return
-
-        channel_value = channel.strip().replace("<#", "").replace(">", "")
-
-        if not channel_value.isdigit():
-            await interaction.response.send_message(
-                "Enter a valid channel mention or channel ID.",
-                ephemeral=True,
-            )
-            return
-
-        target = interaction.guild.get_channel(int(channel_value))
-
-        if not isinstance(target, discord.TextChannel):
-            await interaction.response.send_message(
-                "That channel is not a text channel in this server.",
-                ephemeral=True,
-            )
-            return
 
         await interaction.response.defer(ephemeral=True)
 
         try:
             await self.bot.db.update_guild_settings(
                 interaction.guild.id,
-                ai_channel_id=target.id,
+                ai_channel_id=channel.id,
             )
 
             await interaction.followup.send(
-                f"AI auto-replies are now configured for {target.mention}.",
+                f"AI auto-replies are now configured for {channel.mention}.",
                 ephemeral=True,
             )
 
@@ -313,6 +290,7 @@ class AIChat(commands.Cog):
                 interaction.guild.id
             )
 
+            # A modal must be the initial interaction response.
             await interaction.response.send_modal(
                 AIPromptModal(settings.get("ai_prompt") or "")
             )
@@ -322,7 +300,7 @@ class AIChat(commands.Cog):
 
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "Could not load the AI personality settings.",
+                    "Could not load AI personality settings.",
                     ephemeral=True,
                 )
 
@@ -345,6 +323,7 @@ class AIChat(commands.Cog):
             )
 
             channel_id = settings.get("ai_channel_id")
+
             channel = (
                 interaction.guild.get_channel(channel_id)
                 if channel_id
@@ -354,12 +333,6 @@ class AIChat(commands.Cog):
             prompt_preview = (
                 settings.get("ai_prompt") or ""
             ).replace("\n", " ")[:160]
-
-            key_status = (
-                "Configured"
-                if self.bot.ai_client
-                else "Missing"
-            )
 
             embed = discord.Embed(
                 title="AI Configuration",
@@ -373,12 +346,6 @@ class AIChat(commands.Cog):
             )
 
             embed.add_field(
-                name="API Key",
-                value=key_status,
-                inline=True,
-            )
-
-            embed.add_field(
                 name="Text Model",
                 value=self.bot.ai_model,
                 inline=True,
@@ -386,7 +353,17 @@ class AIChat(commands.Cog):
 
             embed.add_field(
                 name="Vision Model",
-                value=self.vision_model,
+                value=VISION_MODEL,
+                inline=True,
+            )
+
+            embed.add_field(
+                name="API Key",
+                value=(
+                    "Configured"
+                    if self.bot.ai_client
+                    else "Missing"
+                ),
                 inline=True,
             )
 
@@ -441,13 +418,104 @@ class AIChat(commands.Cog):
                 ephemeral=True,
             )
 
+    async def analyze_images(
+        self,
+        image_parts: list[dict],
+    ) -> str:
+        """
+        Stage 1:
+        Qwen analyzes the images without Sammy's personality prompt.
+        """
+
+        vision_messages = [
+            {
+                "role": "system",
+                "content": VISION_INSTRUCTIONS,
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Please describe the attached image or images. "
+                            "Focus on visible details and avoid guessing."
+                        ),
+                    },
+                    *image_parts,
+                ],
+            },
+        ]
+
+        completion = await self.bot.ai_client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=vision_messages,
+            max_completion_tokens=900,
+        )
+
+        description = (
+            completion.choices[0].message.content or ""
+        ).strip()
+
+        if not description:
+            raise RuntimeError("Vision model returned an empty description.")
+
+        return description[:5000]
+
+    async def generate_text_reply(
+        self,
+        settings: dict,
+        history: list[dict],
+        user_text: str,
+    ) -> str:
+        """
+        Stage 2:
+        GPT-OSS receives the image description and conversation history.
+        It generates the only final reply shown in Discord.
+        """
+
+        system_prompt = (
+            settings.get("ai_prompt")
+            or "You are a helpful assistant."
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt,
+            }
+        ]
+
+        messages.extend(history)
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_text[:6000],
+            }
+        )
+
+        completion = await self.bot.ai_client.chat.completions.create(
+            model=self.bot.ai_model,
+            messages=messages,
+            max_tokens=self.bot.ai_max_tokens,
+        )
+
+        answer = (
+            completion.choices[0].message.content or ""
+        ).strip()
+
+        if not answer:
+            return "I could not generate a response. Please try again."
+
+        return answer
+
     @commands.Cog.listener()
     async def on_message(
         self,
         message: discord.Message,
     ) -> None:
 
-        # 忽略私訊、機器人訊息及非一般文字頻道
         if (
             message.guild is None
             or message.author.bot
@@ -461,7 +529,7 @@ class AIChat(commands.Cog):
             if is_image_attachment(attachment)
         ]
 
-        # 文字和圖片都沒有，就不處理
+        # Ignore messages that contain neither text nor images.
         if not message.content.strip() and not image_attachments:
             return
 
@@ -472,16 +540,14 @@ class AIChat(commands.Cog):
 
             ai_channel_id = settings.get("ai_channel_id")
 
-            if not ai_channel_id:
-                return
-
-            if message.channel.id != ai_channel_id:
+            if (
+                not ai_channel_id
+                or message.channel.id != ai_channel_id
+            ):
                 return
 
             if self.bot.ai_client is None:
-                log.error(
-                    "AI channel is enabled but AI_API_KEY is not configured."
-                )
+                log.error("AI_API_KEY is not configured.")
                 return
 
             async with self.channel_locks[message.channel.id]:
@@ -492,25 +558,20 @@ class AIChat(commands.Cog):
                     limit=self.bot.ai_history_limit,
                 )
 
-                # 保留原本的文字對話記憶
-                messages = [
-                    {
-                        "role": "system",
-                        "content": settings.get("ai_prompt")
-                        or "You are a helpful assistant.",
-                    }
-                ]
-
-                messages.extend(history)
-
                 user_text = message.content.strip()
 
-                # 有圖片時，下載附件並建立 Vision 輸入
+                # Stage 1: image analysis, only when images exist.
                 if image_attachments:
+
                     try:
-                        image_parts, filenames = await build_image_content(
+                        image_parts = await prepare_images(
                             image_attachments
                         )
+
+                        async with message.channel.typing():
+                            image_description = await self.analyze_images(
+                                image_parts
+                            )
 
                     except ValueError as exc:
                         await message.reply(
@@ -521,99 +582,55 @@ class AIChat(commands.Cog):
                         return
 
                     except Exception:
-                        log.exception("Could not download image attachments")
+                        log.exception("Vision image analysis failed")
 
                         await message.reply(
-                            "I could not read the attached image. Please try again.",
+                            "I could not analyze that image. Please try again later.",
                             mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                         return
 
                     if not user_text:
-                        user_text = "Please analyze the attached image(s) and describe what you can see."
+                        user_text = (
+                            "Please describe the image I sent."
+                        )
 
-                    # 圖片和文字放在同一個 user message
-                    user_content = [
-                        {
-                            "type": "text",
-                            "text": user_text[:6000],
-                        }
-                    ]
-
-                    user_content.extend(image_parts)
-
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": user_content,
-                        }
-                    )
-
-                    selected_model = self.vision_model
-
-                    # 資料庫只儲存文字，不儲存圖片的 Base64 內容
-                    history_user_text = (
-                        user_text[:5000]
-                        + "\n[Attached image(s): "
-                        + ", ".join(filenames)
-                        + "]"
+                    # The image itself is not saved as Base64.
+                    # Its textual analysis is saved in conversation history.
+                    combined_user_text = (
+                        f"{user_text}\n\n"
+                        "[Image analysis from Vision model]\n"
+                        f"{image_description}\n"
+                        "[End of image analysis]"
                     )
 
                 else:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": message.content[:6000],
-                        }
-                    )
+                    combined_user_text = user_text
 
-                    selected_model = self.bot.ai_model
-                    history_user_text = message.content[:6000]
-
+                # Stage 2: GPT-OSS generates the final response.
                 try:
                     async with message.channel.typing():
-
-                        request_options = {
-                            "model": selected_model,
-                            "messages": messages,
-                        }
-
-                        if image_attachments:
-                            request_options["max_completion_tokens"] = (
-                                self.bot.ai_max_tokens
-                            )
-                        else:
-                            request_options["max_tokens"] = (
-                                self.bot.ai_max_tokens
-                            )
-
-                        completion = await self.bot.ai_client.chat.completions.create(
-                            **request_options
+                        answer = await self.generate_text_reply(
+                            settings,
+                            history,
+                            combined_user_text,
                         )
 
-                    answer = (
-                        completion.choices[0].message.content or ""
-                    ).strip()
-
-                    if not answer:
-                        answer = (
-                            "I could not generate a response. Please try again."
-                        )
-
-                    # 儲存文字形式的歷史，不儲存圖片資料
+                    # Save the user's text plus image description.
+                    # Future text-only messages can remember the image.
                     await self.bot.db.add_ai_history(
                         message.guild.id,
                         message.channel.id,
                         "user",
-                        history_user_text[:6000],
+                        combined_user_text[:MAX_HISTORY_TEXT],
                     )
 
                     await self.bot.db.add_ai_history(
                         message.guild.id,
                         message.channel.id,
                         "assistant",
-                        answer[:6000],
+                        answer[:MAX_HISTORY_TEXT],
                     )
 
                     await message.reply(
@@ -623,19 +640,13 @@ class AIChat(commands.Cog):
                     )
 
                 except Exception:
-                    log.exception(
-                        "AI response failed in channel %s",
-                        message.channel.id,
-                    )
+                    log.exception("GPT-OSS response failed")
 
-                    try:
-                        await message.reply(
-                            "I'm temporarily unable to respond. Please try again later.",
-                            mention_author=False,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    except discord.HTTPException:
-                        pass
+                    await message.reply(
+                        "I'm temporarily unable to respond. Please try again later.",
+                        mention_author=False,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
 
         except Exception:
             log.exception(
