@@ -1,531 +1,314 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
-import re
-from typing import Optional
+import socket
+from io import BytesIO
+from urllib.parse import urljoin, urlsplit
 
+import aiohttp
 import discord
-from discord import app_commands
-from discord.ext import commands
-
-from image_card import create_welcome_card
+from PIL import Image, ImageDraw, ImageOps
 
 log = logging.getLogger(__name__)
 
+MAX_BACKGROUND_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+CARD_SIZE = (1100, 500)
 
-def render_welcome_template(
-    template: str,
-    member: discord.Member,
-) -> str:
-    replacements = {
-        "<id>": member.display_name,
-        "%guild%": member.guild.name,
-        "%user%": member.mention,
-        "%member_count%": str(
-            member.guild.member_count or len(member.guild.members)
-        ),
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+async def _validate_public_https_url(url: str) -> None:
+    parsed = urlsplit(url)
+
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError("Use a public HTTPS image URL.")
+
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ValueError("Invalid image URL port.") from exc
+
+    loop = asyncio.get_running_loop()
+
+    try:
+        addresses = await loop.getaddrinfo(
+            parsed.hostname,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise ValueError("The image host could not be reached.") from exc
+
+    if not addresses:
+        raise ValueError("The image host has no public address.")
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0])
+
+        if not ip.is_global:
+            raise ValueError("Private or local image hosts are not allowed.")
+
+
+async def _download_background(url: str) -> Image.Image:
+    timeout = aiohttp.ClientTimeout(
+        total=20,
+        connect=8,
+        sock_read=12,
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SammyWelcomeBot/1.0)",
+        "Accept": "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*",
     }
 
-    result = template or "Welcome %user% to %guild%!"
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        headers=headers,
+    ) as session:
 
-    for token, value in replacements.items():
-        result = result.replace(token, value)
+        current_url = url
 
-    return result[:1900]
+        for _ in range(6):
+            await _validate_public_https_url(current_url)
 
+            async with session.get(
+                current_url,
+                allow_redirects=False,
+            ) as response:
 
-def parse_channel_id(value: str) -> Optional[int]:
-    match = re.fullmatch(
-        r"\s*(?:<#(\d+)>|(\d+))\s*",
-        value,
-    )
+                if response.status in REDIRECT_STATUSES:
+                    location = response.headers.get("Location")
 
-    if not match:
-        return None
+                    if not location:
+                        raise ValueError("Image redirect has no location.")
 
-    return int(match.group(1) or match.group(2))
+                    current_url = urljoin(current_url, location)
+                    continue
 
+                if response.status != 200:
+                    raise ValueError(
+                        f"Image URL returned HTTP {response.status}."
+                    )
 
-def get_avatar_position(settings: dict) -> str:
-    position = settings.get("avatar_position") or "center"
+                content_length = response.content_length
 
-    if position not in ("left", "center", "right"):
-        return "center"
+                if (
+                    content_length is not None
+                    and content_length > MAX_BACKGROUND_BYTES
+                ):
+                    raise ValueError("Image is larger than 8 MB.")
 
-    return position
-
-
-class WelcomeConfigModal(
-    discord.ui.Modal,
-    title="Welcome Message Setup",
-):
-    channel = discord.ui.TextInput(
-        label="Welcome channel ID or mention",
-        placeholder="Example: <#123456789012345678>",
-        max_length=80,
-    )
-
-    template = discord.ui.TextInput(
-        label="Welcome message template",
-        style=discord.TextStyle.paragraph,
-        max_length=1500,
-        placeholder="Welcome <id> to %guild%! You are member #%member_count%.",
-    )
-
-    def __init__(
-        self,
-        current_channel: str = "",
-        current_template: str = "",
-    ) -> None:
-        super().__init__()
-
-        if current_channel:
-            self.channel.default = current_channel
-
-        if current_template:
-            self.template.default = current_template
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This form can only be used in a server.",
-                ephemeral=True,
-            )
-            return
-
-        channel_id = parse_channel_id(str(self.channel.value))
-
-        if channel_id is None:
-            await interaction.response.send_message(
-                "I could not read that channel. Use a channel mention or numeric ID.",
-                ephemeral=True,
-            )
-            return
-
-        channel = interaction.guild.get_channel(channel_id)
-
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message(
-                "That ID is not a text channel in this server.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            await interaction.client.db.update_guild_settings(
-                interaction.guild.id,
-                welcome_channel_id=channel.id,
-                welcome_template=str(self.template.value).strip(),
-            )
-
-            await interaction.followup.send(
-                f"Welcome settings saved. Channel: {channel.mention}",
-                ephemeral=True,
-            )
-
-        except Exception:
-            log.exception("Could not save welcome settings")
-
-            await interaction.followup.send(
-                "Could not save welcome settings. Check bot logs.",
-                ephemeral=True,
-            )
-
-
-class WelcomeImageModal(
-    discord.ui.Modal,
-    title="Welcome Image Setup",
-):
-    image_url = discord.ui.TextInput(
-        label="Direct HTTPS image URL",
-        placeholder="https://example.com/welcome.png",
-        required=False,
-        max_length=1000,
-    )
-
-    def __init__(self, current_url: str = "") -> None:
-        super().__init__()
-
-        if current_url:
-            self.image_url.default = current_url
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This form can only be used in a server.",
-                ephemeral=True,
-            )
-            return
-
-        url = str(self.image_url.value).strip() or None
-
-        if url and not url.lower().startswith("https://"):
-            await interaction.response.send_message(
-                "Please use a direct HTTPS image URL.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            await interaction.client.db.update_guild_settings(
-                interaction.guild.id,
-                welcome_image_url=url,
-            )
-
-            await interaction.followup.send(
-                "Welcome image URL saved." if url
-                else "Welcome image URL cleared.",
-                ephemeral=True,
-            )
-
-        except Exception:
-            log.exception("Could not save welcome image URL")
-
-            await interaction.followup.send(
-                "Could not save image settings.",
-                ephemeral=True,
-            )
-
-
-class Welcome(commands.Cog):
-
-    welcome = app_commands.Group(
-        name="welcome",
-        description="Configure welcome messages and images",
-    )
-
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
-
-    @welcome.command(
-        name="configure",
-        description="Set the welcome channel and message template",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def configure(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-
-        # Modal 必須是第一次互動回應，不能先 defer。
-        try:
-            settings = await self.bot.db.get_guild_settings(
-                interaction.guild.id
-            )
-
-            channel_id = settings.get("welcome_channel_id")
-            template = settings.get("welcome_template") or ""
-
-            await interaction.response.send_modal(
-                WelcomeConfigModal(
-                    str(channel_id) if channel_id else "",
-                    template,
-                )
-            )
-
-        except Exception:
-            log.exception("Welcome configure failed")
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Could not load welcome settings.",
-                    ephemeral=True,
+                data = await response.content.read(
+                    MAX_BACKGROUND_BYTES + 1
                 )
 
-    @welcome.command(
-        name="enable",
-        description="Enable or disable welcome messages",
-    )
-    @app_commands.describe(enabled="Turn welcome messages on or off")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def enable(
-        self,
-        interaction: discord.Interaction,
-        enabled: bool,
-    ) -> None:
+                if len(data) > MAX_BACKGROUND_BYTES:
+                    raise ValueError("Image is larger than 8 MB.")
 
-        await interaction.response.defer(ephemeral=True)
+                break
+        else:
+            raise ValueError("Too many image redirects.")
 
-        try:
-            await self.bot.db.update_guild_settings(
-                interaction.guild.id,
-                welcome_enabled=int(enabled),
-            )
+    return await asyncio.to_thread(_decode_image, data)
 
-            await interaction.followup.send(
-                f"Welcome messages are now {'enabled' if enabled else 'disabled'}.",
-                ephemeral=True,
-            )
 
-        except Exception:
-            log.exception("Welcome enable failed")
+def _decode_image(data: bytes) -> Image.Image:
+    if not data:
+        raise ValueError("Empty image response.")
 
-            await interaction.followup.send(
-                "Could not update welcome settings.",
-                ephemeral=True,
-            )
+    with Image.open(BytesIO(data)) as source:
+        if source.width * source.height > MAX_IMAGE_PIXELS:
+            raise ValueError("Image dimensions are too large.")
 
-    @welcome.command(
-        name="image",
-        description="Set the welcome background image URL",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def image(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
+        source.seek(0)
+        source.load()
 
-        try:
-            settings = await self.bot.db.get_guild_settings(
-                interaction.guild.id
-            )
+        image = ImageOps.exif_transpose(source)
+        return image.convert("RGB")
 
-            await interaction.response.send_modal(
-                WelcomeImageModal(
-                    settings.get("welcome_image_url") or ""
-                )
-            )
 
-        except Exception:
-            log.exception("Welcome image command failed")
+def _create_default_background() -> Image.Image:
+    width, height = CARD_SIZE
 
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Could not load image settings.",
-                    ephemeral=True,
-                )
+    image = Image.new("RGB", CARD_SIZE)
+    draw = ImageDraw.Draw(image)
 
-    @welcome.command(
-        name="image-toggle",
-        description="Enable or disable welcome images",
-    )
-    @app_commands.describe(enabled="Turn welcome images on or off")
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def image_toggle(
-        self,
-        interaction: discord.Interaction,
-        enabled: bool,
-    ) -> None:
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
 
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            await self.bot.db.update_guild_settings(
-                interaction.guild.id,
-                welcome_image_enabled=int(enabled),
-            )
-
-            await interaction.followup.send(
-                f"Welcome images are now {'enabled' if enabled else 'disabled'}.",
-                ephemeral=True,
-            )
-
-        except Exception:
-            log.exception("Welcome image toggle failed")
-
-            await interaction.followup.send(
-                "Could not update image settings.",
-                ephemeral=True,
-            )
-
-    @welcome.command(
-        name="avatar-position",
-        description="Choose where the joining member's avatar appears",
-    )
-    @app_commands.choices(
-        position=[
-            app_commands.Choice(name="Left", value="left"),
-            app_commands.Choice(name="Center", value="center"),
-            app_commands.Choice(name="Right", value="right"),
-        ]
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def avatar_position(
-        self,
-        interaction: discord.Interaction,
-        position: app_commands.Choice[str],
-    ) -> None:
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            await self.bot.db.update_guild_settings(
-                interaction.guild.id,
-                avatar_position=position.value,
-            )
-
-            await interaction.followup.send(
-                f"Avatar position set to **{position.name}**.",
-                ephemeral=True,
-            )
-
-        except Exception:
-            log.exception("Avatar position update failed")
-
-            await interaction.followup.send(
-                "Could not update avatar position.",
-                ephemeral=True,
-            )
-
-    @welcome.command(
-        name="test",
-        description="Preview the current welcome message and image",
-    )
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.guild_only()
-    async def test(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
+        color = (
+            int(90 + ratio * 45),
+            int(120 + ratio * 20),
+            int(200 + ratio * 35),
         )
 
-        try:
-            settings = await self.bot.db.get_guild_settings(
-                interaction.guild.id
-            )
+        draw.line(
+            (0, y, width, y),
+            fill=color,
+        )
 
-            sample_member = interaction.user
+    draw.ellipse(
+        (-120, -180, 330, 270),
+        fill=(125, 155, 225),
+    )
 
-            if not isinstance(sample_member, discord.Member):
-                await interaction.followup.send(
-                    "This command must be used in a server.",
-                    ephemeral=True,
-                )
-                return
+    draw.ellipse(
+        (800, 280, 1250, 730),
+        fill=(115, 125, 210),
+    )
 
-            content = render_welcome_template(
-                settings.get("welcome_template") or "",
-                sample_member,
-            )
+    draw.ellipse(
+        (780, -130, 1050, 140),
+        fill=(145, 160, 230),
+    )
 
-            if (
-                settings.get("welcome_image_enabled")
-                and settings.get("welcome_image_url")
-            ):
-                card = await create_welcome_card(
-                    sample_member,
-                    settings.get("welcome_image_url"),
-                    get_avatar_position(settings),
-                )
-
-                await interaction.followup.send(
-                    content=content,
-                    file=discord.File(
-                        card,
-                        filename="welcome-preview.png",
-                    ),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
-
-            await interaction.followup.send(
-                content or "Welcome message is empty.",
-                ephemeral=True,
-            )
-
-        except Exception:
-            log.exception("Welcome preview failed")
-
-            await interaction.followup.send(
-                "Could not create welcome preview. Check Render logs.",
-                ephemeral=True,
-            )
-
-    @commands.Cog.listener()
-    async def on_member_join(
-        self,
-        member: discord.Member,
-    ) -> None:
-
-        try:
-            settings = await self.bot.db.get_guild_settings(
-                member.guild.id
-            )
-
-            if not settings.get("welcome_enabled"):
-                return
-
-            channel_id = settings.get("welcome_channel_id")
-
-            if not channel_id:
-                return
-
-            channel = member.guild.get_channel(channel_id)
-
-            if not isinstance(channel, discord.TextChannel):
-                log.warning(
-                    "Welcome channel %s is missing in guild %s",
-                    channel_id,
-                    member.guild.id,
-                )
-                return
-
-            content = render_welcome_template(
-                settings.get("welcome_template") or "",
-                member,
-            )
-
-            allowed_mentions = discord.AllowedMentions(
-                users=True,
-                roles=False,
-                everyone=False,
-                replied_user=False,
-            )
-
-            if (
-                settings.get("welcome_image_enabled")
-                and settings.get("welcome_image_url")
-            ):
-                card = await create_welcome_card(
-                    member,
-                    settings.get("welcome_image_url"),
-                    get_avatar_position(settings),
-                )
-
-                await channel.send(
-                    content=content,
-                    file=discord.File(
-                        card,
-                        filename="welcome.png",
-                    ),
-                    allowed_mentions=allowed_mentions,
-                )
-                return
-
-            await channel.send(
-                content=content,
-                allowed_mentions=allowed_mentions,
-            )
-
-        except Exception:
-            log.exception(
-                "Welcome event failed for guild %s",
-                member.guild.id,
-            )
+    return image
 
 
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Welcome(bot))
+def _prepare_avatar(avatar_bytes: bytes) -> Image.Image:
+    with Image.open(BytesIO(avatar_bytes)) as source:
+        source.seek(0)
+        source.load()
+
+        avatar = ImageOps.exif_transpose(source).convert("RGBA")
+
+    diameter = 250
+
+    avatar = ImageOps.fit(
+        avatar,
+        (diameter, diameter),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+    mask = Image.new("L", (diameter, diameter), 0)
+
+    ImageDraw.Draw(mask).ellipse(
+        (0, 0, diameter - 1, diameter - 1),
+        fill=255,
+    )
+
+    avatar.putalpha(mask)
+
+    return avatar
+
+
+def _get_avatar_position(
+    position: str | None,
+    width: int,
+) -> int:
+
+    position = (position or "center").strip().lower()
+
+    position_map = {
+        "left": int(width * 0.18),
+        "center": width // 2,
+        "right": int(width * 0.82),
+    }
+
+    return position_map.get(
+        position,
+        position_map["center"],
+    )
+
+
+async def create_welcome_card(
+    member: discord.Member,
+    background_url: str | None,
+    position: str = "center",
+) -> BytesIO:
+
+    try:
+        if not background_url:
+            raise ValueError("No background image configured.")
+
+        background = await _download_background(background_url)
+
+    except Exception as exc:
+        log.warning(
+            "Welcome background failed for guild %s: %s",
+            member.guild.id,
+            exc,
+        )
+
+        background = _create_default_background()
+
+    background = ImageOps.fit(
+        background,
+        CARD_SIZE,
+        method=Image.Resampling.LANCZOS,
+    )
+
+    width, height = CARD_SIZE
+    diameter = 250
+    border_width = 8
+
+    try:
+        avatar_bytes = await member.display_avatar.replace(
+            size=256,
+            static_format="png",
+        ).read()
+
+        avatar = await asyncio.to_thread(
+            _prepare_avatar,
+            avatar_bytes,
+        )
+
+    except Exception as exc:
+        log.warning(
+            "Could not load avatar for member %s: %s",
+            member.id,
+            exc,
+        )
+
+        avatar = Image.new(
+            "RGBA",
+            (diameter, diameter),
+            (120, 145, 210, 255),
+        )
+
+    center_x = _get_avatar_position(position, width)
+    center_y = int(height * 0.39)
+
+    left = center_x - diameter // 2
+    top = center_y - diameter // 2
+
+    background_rgba = background.convert("RGBA")
+    draw = ImageDraw.Draw(background_rgba)
+
+    draw.ellipse(
+        (
+            left - border_width,
+            top - border_width,
+            left + diameter + border_width,
+            top + diameter + border_width,
+        ),
+        fill=(255, 112, 122, 255),
+    )
+
+    background_rgba.alpha_composite(
+        avatar,
+        (left, top),
+    )
+
+    output = BytesIO()
+
+    background_rgba.convert("RGB").save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
+
+    output.seek(0)
+
+    return output
