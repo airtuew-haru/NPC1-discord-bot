@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 import os
+import re
 from collections import defaultdict
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 log = logging.getLogger(__name__)
 
@@ -23,23 +26,32 @@ MAX_IMAGE_SIZE = 6 * 1024 * 1024
 MAX_TOTAL_IMAGE_SIZE = 12 * 1024 * 1024
 MAX_HISTORY_TEXT = 5000
 
-VISION_INSTRUCTIONS = """
-You are an image analysis component.
+# 每張原圖會額外切成四個區域。
+CROP_OVERLAP = 0.12
 
-Your task is to describe only what is visibly supported by the image.
+# 每次 Vision API 請求最多傳入三張圖片。
+VISION_BATCH_SIZE = 3
+
+VISION_INSTRUCTIONS = """
+You are a neutral image analysis component.
+
+Your task is to analyze the provided original images and image crops.
 
 Rules:
-1. Describe the visible objects, characters, colors, clothing,
-   positions, expressions, and background.
-2. Do not invent names, identities, relationships, or events.
-3. Do not claim that an image is upside down unless there is
-   clear visual evidence.
-4. If something is unclear, explicitly say that it is uncertain.
-5. For anime illustrations, describe visible character features
+1. Describe only what is visibly supported by the images.
+2. Pay close attention to small details, text, objects, clothing,
+   colors, expressions, and background elements.
+3. Analyze each provided crop carefully.
+4. Crops may overlap. Avoid repeating the same observation.
+5. Combine observations from different regions when possible.
+6. Do not invent names, identities, relationships, or events.
+7. Do not claim that an image is upside down without clear evidence.
+8. If something is unclear, explicitly say that it is uncertain.
+9. For anime illustrations, describe visible character features
    rather than guessing the character's identity.
-6. Do not roleplay or use a fictional personality.
-7. Reply in Traditional Chinese.
-8. Keep the description concise but useful.
+10. Do not roleplay or use a fictional personality.
+11. Reply in Traditional Chinese.
+12. Organize the description clearly and include useful details.
 """
 
 
@@ -65,19 +77,217 @@ def detect_image_mime(data: bytes) -> str | None:
 def is_image_attachment(
     attachment: discord.Attachment,
 ) -> bool:
+    """Only accept JPG, PNG, and WEBP attachments."""
+
     content_type = (attachment.content_type or "").lower()
     filename = attachment.filename.lower()
 
     return (
-        content_type.startswith("image/")
-        or filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif"))
+        content_type in {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+        or filename.endswith(
+            (".jpg", ".jpeg", ".png", ".webp")
+        )
     )
+
+
+def encode_image(
+    data: bytes,
+    mime_type: str,
+    label: str,
+) -> dict:
+    """Convert image bytes into an OpenAI-compatible image part."""
+
+    encoded = base64.b64encode(data).decode("ascii")
+
+    return {
+        "label": label,
+        "part": {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{encoded}",
+                "detail": "auto",
+            },
+        },
+    }
+
+
+def encode_crop(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    label: str,
+    output_format: str,
+) -> dict:
+    """Crop an image region and encode it."""
+
+    cropped = image.crop(box)
+    output = io.BytesIO()
+
+    if output_format == "JPEG":
+        if cropped.mode not in ("RGB", "L"):
+            cropped = cropped.convert("RGB")
+
+        cropped.save(
+            output,
+            format="JPEG",
+            quality=92,
+            optimize=True,
+        )
+        mime_type = "image/jpeg"
+
+    elif output_format == "WEBP":
+        cropped.save(
+            output,
+            format="WEBP",
+            quality=92,
+            method=4,
+        )
+        mime_type = "image/webp"
+
+    else:
+        cropped.save(
+            output,
+            format="PNG",
+            optimize=True,
+        )
+        mime_type = "image/png"
+
+    return encode_image(
+        output.getvalue(),
+        mime_type,
+        label,
+    )
+
+
+def create_image_regions(
+    image: Image.Image,
+    filename: str,
+    mime_type: str,
+) -> list[dict]:
+    """
+    Create one original image and four overlapping crops.
+
+    The crops preserve their original pixel resolution.
+    """
+
+    width, height = image.size
+
+    if width < 2 or height < 2:
+        raise ValueError(
+            f"{filename} has invalid image dimensions."
+        )
+
+    output_format = {
+        "image/jpeg": "JPEG",
+        "image/png": "PNG",
+        "image/webp": "WEBP",
+    }[mime_type]
+
+    # Encode the complete original image.
+    original_buffer = io.BytesIO()
+
+    if output_format == "JPEG":
+        original = image.convert("RGB")
+        original.save(
+            original_buffer,
+            format="JPEG",
+            quality=95,
+            optimize=True,
+        )
+
+    elif output_format == "WEBP":
+        image.save(
+            original_buffer,
+            format="WEBP",
+            quality=95,
+            method=4,
+        )
+
+    else:
+        image.save(
+            original_buffer,
+            format="PNG",
+            optimize=True,
+        )
+
+    original_part = encode_image(
+        original_buffer.getvalue(),
+        mime_type,
+        f"{filename} - Full image",
+    )
+
+    # Calculate overlapping crop boundaries.
+    overlap_x = int(width * CROP_OVERLAP)
+    overlap_y = int(height * CROP_OVERLAP)
+
+    mid_x = width // 2
+    mid_y = height // 2
+
+    regions = [
+        (
+            "Top-left region",
+            (
+                0,
+                0,
+                min(width, mid_x + overlap_x),
+                min(height, mid_y + overlap_y),
+            ),
+        ),
+        (
+            "Top-right region",
+            (
+                max(0, mid_x - overlap_x),
+                0,
+                width,
+                min(height, mid_y + overlap_y),
+            ),
+        ),
+        (
+            "Bottom-left region",
+            (
+                0,
+                max(0, mid_y - overlap_y),
+                min(width, mid_x + overlap_x),
+                height,
+            ),
+        ),
+        (
+            "Bottom-right region",
+            (
+                max(0, mid_x - overlap_x),
+                max(0, mid_y - overlap_y),
+                width,
+                height,
+            ),
+        ),
+    ]
+
+    results = [original_part]
+
+    for region_name, box in regions:
+        results.append(
+            encode_crop(
+                image,
+                box,
+                f"{filename} - {region_name}",
+                output_format,
+            )
+        )
+
+    return results
 
 
 async def prepare_images(
     attachments: list[discord.Attachment],
 ) -> list[dict]:
-    """Download and encode Discord image attachments."""
+    """
+    Download original Discord attachments.
+
+    Return one full image and four crops per attachment.
+    """
 
     if len(attachments) > MAX_IMAGES:
         raise ValueError(
@@ -85,7 +295,7 @@ async def prepare_images(
         )
 
     total_size = 0
-    image_parts = []
+    image_entries = []
 
     for attachment in attachments:
         if attachment.size > MAX_IMAGE_SIZE:
@@ -97,7 +307,7 @@ async def prepare_images(
 
         if total_size > MAX_TOTAL_IMAGE_SIZE:
             raise ValueError(
-                "The total image size cannot exceed 12 MB."
+                "The total original image size cannot exceed 12 MB."
             )
 
         data = await attachment.read()
@@ -111,23 +321,41 @@ async def prepare_images(
 
         if mime_type is None:
             raise ValueError(
-                f"{attachment.filename} is not a supported image. "
+                f"{attachment.filename} is not supported. "
                 "Please use JPG, PNG, or WEBP."
             )
 
-        encoded = base64.b64encode(data).decode("ascii")
+        try:
+            with Image.open(io.BytesIO(data)) as source:
+                image = ImageOps.exif_transpose(source)
+                image.load()
 
-        image_parts.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime_type};base64,{encoded}",
-                    "detail": "auto",
-                },
-            }
+                if image.width * image.height > 40_000_000:
+                    raise ValueError(
+                        f"{attachment.filename} has too many pixels."
+                    )
+
+                # Create independent image data before closing source.
+                image = image.copy()
+
+        except (
+            UnidentifiedImageError,
+            OSError,
+            Image.DecompressionBombError,
+        ) as exc:
+            raise ValueError(
+                f"Could not read {attachment.filename} as a valid image."
+            ) from exc
+
+        image_entries.extend(
+            create_image_regions(
+                image,
+                attachment.filename,
+                mime_type,
+            )
         )
 
-    return image_parts
+    return image_entries
 
 
 class AIPromptModal(
@@ -201,9 +429,8 @@ class AIChat(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-        # Prevent simultaneous requests from mixing channel history.
-        self.channel_locks: defaultdict[int, asyncio.Lock] = defaultdict(
-            asyncio.Lock
+        self.channel_locks: defaultdict[int, asyncio.Lock] = (
+            defaultdict(asyncio.Lock)
         )
 
     @ai.command(
@@ -211,26 +438,57 @@ class AIChat(commands.Cog):
         description="Set the channel where the AI replies to every human message",
     )
     @app_commands.describe(
-        channel="The text channel monitored by the AI"
+        channel="Enter a channel mention or channel ID"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def set_channel(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
+        channel: str,
     ) -> None:
+
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        # Accept both <#CHANNEL_ID> and plain numeric IDs.
+        match = re.fullmatch(
+            r"(?:<#)?(\d{15,25})>?",
+            channel.strip(),
+        )
+
+        if not match:
+            await interaction.response.send_message(
+                "Please enter a valid channel mention or channel ID.",
+                ephemeral=True,
+            )
+            return
+
+        channel_id = int(match.group(1))
+        target = interaction.guild.get_channel(channel_id)
+
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message(
+                "The specified channel is not a text channel "
+                "in this server.",
+                ephemeral=True,
+            )
+            return
 
         await interaction.response.defer(ephemeral=True)
 
         try:
             await self.bot.db.update_guild_settings(
                 interaction.guild.id,
-                ai_channel_id=channel.id,
+                ai_channel_id=target.id,
             )
 
             await interaction.followup.send(
-                f"AI auto-replies are now configured for {channel.mention}.",
+                f"AI auto-replies are now configured for {target.mention}.",
                 ephemeral=True,
             )
 
@@ -290,9 +548,10 @@ class AIChat(commands.Cog):
                 interaction.guild.id
             )
 
-            # A modal must be the initial interaction response.
             await interaction.response.send_modal(
-                AIPromptModal(settings.get("ai_prompt") or "")
+                AIPromptModal(
+                    settings.get("ai_prompt") or ""
+                )
             )
 
         except Exception:
@@ -420,47 +679,81 @@ class AIChat(commands.Cog):
 
     async def analyze_images(
         self,
-        image_parts: list[dict],
+        image_entries: list[dict],
     ) -> str:
         """
         Stage 1:
-        Qwen analyzes the images without Sammy's personality prompt.
+        Qwen analyzes the original images and their crops.
+
+        Each request contains no more than three images.
         """
 
-        vision_messages = [
-            {
-                "role": "system",
-                "content": VISION_INSTRUCTIONS,
-            },
-            {
-                "role": "user",
-                "content": [
+        descriptions = []
+
+        for batch_start in range(
+            0,
+            len(image_entries),
+            VISION_BATCH_SIZE,
+        ):
+            batch = image_entries[
+                batch_start:batch_start + VISION_BATCH_SIZE
+            ]
+
+            content = [
+                {
+                    "type": "text",
+                    "text": (
+                        "Analyze the following image material carefully. "
+                        "Some images are full images and others are crops "
+                        "of the same original image. "
+                        "Pay attention to small details."
+                    ),
+                }
+            ]
+
+            for entry in batch:
+                content.append(
                     {
                         "type": "text",
-                        "text": (
-                            "Please describe the attached image or images. "
-                            "Focus on visible details and avoid guessing."
-                        ),
-                    },
-                    *image_parts,
-                ],
-            },
-        ]
+                        "text": f"Image region: {entry['label']}",
+                    }
+                )
+                content.append(entry["part"])
 
-        completion = await self.bot.ai_client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=vision_messages,
-            max_completion_tokens=900,
-        )
+            vision_messages = [
+                {
+                    "role": "system",
+                    "content": VISION_INSTRUCTIONS,
+                },
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ]
 
-        description = (
-            completion.choices[0].message.content or ""
-        ).strip()
+            completion = (
+                await self.bot.ai_client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=vision_messages,
+                    max_completion_tokens=900,
+                )
+            )
 
-        if not description:
-            raise RuntimeError("Vision model returned an empty description.")
+            description = (
+                completion.choices[0].message.content or ""
+            ).strip()
 
-        return description[:5000]
+            if not description:
+                raise RuntimeError(
+                    "Vision model returned an empty description."
+                )
+
+            descriptions.append(
+                f"Analysis batch {len(descriptions) + 1}:\n"
+                f"{description}"
+            )
+
+        return "\n\n".join(descriptions)[:MAX_HISTORY_TEXT]
 
     async def generate_text_reply(
         self,
@@ -470,8 +763,8 @@ class AIChat(commands.Cog):
     ) -> str:
         """
         Stage 2:
-        GPT-OSS receives the image description and conversation history.
-        It generates the only final reply shown in Discord.
+        GPT-OSS generates the final reply using image analysis
+        and the existing conversation history.
         """
 
         system_prompt = (
@@ -495,10 +788,12 @@ class AIChat(commands.Cog):
             }
         )
 
-        completion = await self.bot.ai_client.chat.completions.create(
-            model=self.bot.ai_model,
-            messages=messages,
-            max_tokens=self.bot.ai_max_tokens,
+        completion = (
+            await self.bot.ai_client.chat.completions.create(
+                model=self.bot.ai_model,
+                messages=messages,
+                max_tokens=self.bot.ai_max_tokens,
+            )
         )
 
         answer = (
@@ -529,7 +824,6 @@ class AIChat(commands.Cog):
             if is_image_attachment(attachment)
         ]
 
-        # Ignore messages that contain neither text nor images.
         if not message.content.strip() and not image_attachments:
             return
 
@@ -560,17 +854,19 @@ class AIChat(commands.Cog):
 
                 user_text = message.content.strip()
 
-                # Stage 1: image analysis, only when images exist.
+                # Stage 1: analyze images when attachments exist.
                 if image_attachments:
 
                     try:
-                        image_parts = await prepare_images(
-                            image_attachments
-                        )
-
                         async with message.channel.typing():
-                            image_description = await self.analyze_images(
-                                image_parts
+                            image_entries = await prepare_images(
+                                image_attachments
+                            )
+
+                            image_description = (
+                                await self.analyze_images(
+                                    image_entries
+                                )
                             )
 
                     except ValueError as exc:
@@ -582,10 +878,13 @@ class AIChat(commands.Cog):
                         return
 
                     except Exception:
-                        log.exception("Vision image analysis failed")
+                        log.exception(
+                            "Vision image analysis failed"
+                        )
 
                         await message.reply(
-                            "I could not analyze that image. Please try again later.",
+                            "I could not analyze that image. "
+                            "Please try again later.",
                             mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
@@ -596,8 +895,6 @@ class AIChat(commands.Cog):
                             "Please describe the image I sent."
                         )
 
-                    # The image itself is not saved as Base64.
-                    # Its textual analysis is saved in conversation history.
                     combined_user_text = (
                         f"{user_text}\n\n"
                         "[Image analysis from Vision model]\n"
@@ -608,7 +905,7 @@ class AIChat(commands.Cog):
                 else:
                     combined_user_text = user_text
 
-                # Stage 2: GPT-OSS generates the final response.
+                # Stage 2: GPT-OSS generates the final reply.
                 try:
                     async with message.channel.typing():
                         answer = await self.generate_text_reply(
@@ -617,8 +914,8 @@ class AIChat(commands.Cog):
                             combined_user_text,
                         )
 
-                    # Save the user's text plus image description.
-                    # Future text-only messages can remember the image.
+                    # Store the text and image description.
+                    # The original image bytes are not stored.
                     await self.bot.db.add_ai_history(
                         message.guild.id,
                         message.channel.id,
@@ -643,7 +940,8 @@ class AIChat(commands.Cog):
                     log.exception("GPT-OSS response failed")
 
                     await message.reply(
-                        "I'm temporarily unable to respond. Please try again later.",
+                        "I'm temporarily unable to respond. "
+                        "Please try again later.",
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
