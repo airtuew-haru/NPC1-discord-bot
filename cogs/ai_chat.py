@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-import re
+import os
 from collections import defaultdict
 
 import discord
@@ -12,72 +13,135 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
+# Vision model：只在訊息包含圖片時使用
+DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
 
-# ==================================================
-# Interaction helpers
-# ==================================================
+# 圖片限制
+MAX_IMAGE_COUNT = 3
+MAX_IMAGE_SIZE = 6 * 1024 * 1024
+MAX_TOTAL_IMAGE_SIZE = 12 * 1024 * 1024
 
-async def defer_interaction(
-    interaction: discord.Interaction,
-) -> None:
-    """Defer an interaction before performing slow operations."""
-    if not interaction.response.is_done():
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
-        )
-
-
-async def send_interaction_message(
-    interaction: discord.Interaction,
-    content: str | None = None,
-    *,
-    embed: discord.Embed | None = None,
-) -> None:
-    """Send a response whether the interaction was deferred or not."""
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                content=content,
-                embed=embed,
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                content=content,
-                embed=embed,
-                ephemeral=True,
-            )
-    except discord.HTTPException:
-        log.exception("Failed to send interaction response")
+SUPPORTED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+}
 
 
-async def send_interaction_error(
-    interaction: discord.Interaction,
-    message: str,
-) -> None:
-    await send_interaction_message(
-        interaction,
-        message,
+def detect_image_mime(data: bytes) -> str | None:
+    """根據檔案內容判斷圖片格式，避免只相信副檔名。"""
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+
+    if (
+        len(data) >= 12
+        and data[:4] == b"RIFF"
+        and data[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+
+    return None
+
+
+def is_image_attachment(
+    attachment: discord.Attachment,
+) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    filename = attachment.filename.lower()
+
+    return (
+        content_type.startswith("image/")
+        or any(filename.endswith(ext) for ext in SUPPORTED_EXTENSIONS)
+        or filename.endswith(".gif")
     )
 
 
-# ==================================================
-# AI personality modal
-# ==================================================
+async def build_image_content(
+    attachments: list[discord.Attachment],
+) -> tuple[list[dict], list[str]]:
+    """
+    下載 Discord 圖片附件，轉換成 Base64 Data URL，
+    供 Vision 模型讀取。
+    """
 
-class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
+    if len(attachments) > MAX_IMAGE_COUNT:
+        raise ValueError(
+            f"You can send up to {MAX_IMAGE_COUNT} images at once."
+        )
 
+    image_parts = []
+    filenames = []
+    total_size = 0
+
+    for attachment in attachments:
+        if attachment.size > MAX_IMAGE_SIZE:
+            raise ValueError(
+                f"{attachment.filename} is larger than 6 MB."
+            )
+
+        total_size += attachment.size
+
+        if total_size > MAX_TOTAL_IMAGE_SIZE:
+            raise ValueError(
+                "The total image size cannot exceed 12 MB."
+            )
+
+        data = await attachment.read()
+
+        if len(data) > MAX_IMAGE_SIZE:
+            raise ValueError(
+                f"{attachment.filename} is larger than 6 MB."
+            )
+
+        mime_type = detect_image_mime(data)
+
+        if mime_type is None:
+            raise ValueError(
+                f"{attachment.filename} is not a supported image. "
+                "Use JPG, PNG, or WEBP."
+            )
+
+        encoded = base64.b64encode(data).decode("ascii")
+
+        data_url = f"data:{mime_type};base64,{encoded}"
+
+        image_parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url,
+                    "detail": "auto",
+                },
+            }
+        )
+
+        filenames.append(attachment.filename)
+
+    return image_parts, filenames
+
+
+class AIPromptModal(
+    discord.ui.Modal,
+    title="AI Personality Setup",
+):
     prompt = discord.ui.TextInput(
         label="System prompt / personality",
         style=discord.TextStyle.paragraph,
-        placeholder="Describe the assistant's role, tone, rules, and preferred language...",
+        placeholder=(
+            "Describe the assistant's role, tone, rules, "
+            "and preferred language..."
+        ),
         max_length=3000,
     )
 
     def __init__(self, current_prompt: str) -> None:
         super().__init__()
-        self.prompt.default = (current_prompt or "")[:3000]
+        self.prompt.default = current_prompt[:3000]
 
     async def on_submit(
         self,
@@ -85,46 +149,42 @@ class AIPromptModal(discord.ui.Modal, title="AI Personality Setup"):
     ) -> None:
 
         if interaction.guild is None:
-            await send_interaction_error(
-                interaction,
+            await interaction.response.send_message(
                 "This form can only be used in a server.",
+                ephemeral=True,
             )
             return
 
         prompt_text = str(self.prompt.value).strip()
 
         if not prompt_text:
-            await send_interaction_error(
-                interaction,
+            await interaction.response.send_message(
                 "The system prompt cannot be empty.",
+                ephemeral=True,
             )
             return
 
-        try:
-            await defer_interaction(interaction)
+        await interaction.response.defer(ephemeral=True)
 
+        try:
             await interaction.client.db.update_guild_settings(
                 interaction.guild.id,
                 ai_prompt=prompt_text,
             )
 
-            await send_interaction_message(
-                interaction,
+            await interaction.followup.send(
                 "AI personality saved.",
+                ephemeral=True,
             )
 
         except Exception:
-            log.exception("Failed to save AI personality")
+            log.exception("Could not save AI personality")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to save AI personality. Please check the bot logs.",
+            await interaction.followup.send(
+                "Could not save the AI personality.",
+                ephemeral=True,
             )
 
-
-# ==================================================
-# AI Cog
-# ==================================================
 
 class AIChat(commands.Cog):
 
@@ -135,124 +195,75 @@ class AIChat(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-
         self.channel_locks: defaultdict[int, asyncio.Lock] = defaultdict(
             asyncio.Lock
         )
 
-    # --------------------------------------------------
-    # Set AI channel
-    # --------------------------------------------------
+        self.vision_model = os.getenv(
+            "AI_VISION_MODEL",
+            DEFAULT_VISION_MODEL,
+        ).strip()
 
     @ai.command(
         name="set-channel",
-        description="Set the channel where the AI replies",
+        description="Set the channel where the AI automatically replies",
     )
     @app_commands.describe(
-        channel_id="Paste the channel ID or channel mention"
+        channel="Enter a text channel mention or channel ID"
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     @app_commands.guild_only()
     async def set_channel(
         self,
         interaction: discord.Interaction,
-        channel_id: str,
+        channel: str,
     ) -> None:
 
-        guild = interaction.guild
-
-        if guild is None:
-            await send_interaction_error(
-                interaction,
+        if interaction.guild is None:
+            await interaction.response.send_message(
                 "This command can only be used in a server.",
+                ephemeral=True,
             )
             return
 
-        match = re.search(r"\d{15,25}", channel_id)
+        channel_value = channel.strip().replace("<#", "").replace(">", "")
 
-        if match is None:
-            await send_interaction_error(
-                interaction,
-                "Invalid channel ID.",
+        if not channel_value.isdigit():
+            await interaction.response.send_message(
+                "Enter a valid channel mention or channel ID.",
+                ephemeral=True,
             )
             return
 
-        target_id = int(match.group())
+        target = interaction.guild.get_channel(int(channel_value))
+
+        if not isinstance(target, discord.TextChannel):
+            await interaction.response.send_message(
+                "That channel is not a text channel in this server.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
 
         try:
-            await defer_interaction(interaction)
-
-            channel = await guild.fetch_channel(target_id)
-
-            if not isinstance(channel, discord.TextChannel):
-                await send_interaction_error(
-                    interaction,
-                    "Please provide a normal text channel.",
-                )
-                return
-
-            bot_member = guild.me
-
-            if bot_member is None:
-                bot_member = await guild.fetch_member(
-                    self.bot.user.id
-                )
-
-            permissions = channel.permissions_for(bot_member)
-
-            if not permissions.view_channel:
-                await send_interaction_error(
-                    interaction,
-                    "The bot cannot view that channel.",
-                )
-                return
-
-            if not permissions.send_messages:
-                await send_interaction_error(
-                    interaction,
-                    "The bot cannot send messages in that channel.",
-                )
-                return
-
             await self.bot.db.update_guild_settings(
-                guild.id,
-                ai_channel_id=channel.id,
+                interaction.guild.id,
+                ai_channel_id=target.id,
             )
 
-            await send_interaction_message(
-                interaction,
-                f"AI auto-replies are now configured for {channel.mention}.",
-            )
-
-            log.info(
-                "AI channel configured: guild_id=%s channel_id=%s",
-                guild.id,
-                channel.id,
-            )
-
-        except discord.NotFound:
-            await send_interaction_error(
-                interaction,
-                "Channel not found. Please check the channel ID.",
-            )
-
-        except discord.Forbidden:
-            await send_interaction_error(
-                interaction,
-                "The bot cannot access that channel.",
+            await interaction.followup.send(
+                f"AI auto-replies are now configured for {target.mention}.",
+                ephemeral=True,
             )
 
         except Exception:
-            log.exception("Failed to set AI channel")
+            log.exception("Could not set AI channel")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to configure the AI channel. Please check the bot logs.",
+            await interaction.followup.send(
+                "Could not save the AI channel.",
+                ephemeral=True,
             )
-
-    # --------------------------------------------------
-    # Disable AI
-    # --------------------------------------------------
 
     @ai.command(
         name="disable",
@@ -265,35 +276,26 @@ class AIChat(commands.Cog):
         interaction: discord.Interaction,
     ) -> None:
 
-        try:
-            await defer_interaction(interaction)
+        await interaction.response.defer(ephemeral=True)
 
+        try:
             await self.bot.db.update_guild_settings(
                 interaction.guild.id,
                 ai_channel_id=None,
             )
 
-            await send_interaction_message(
-                interaction,
+            await interaction.followup.send(
                 "AI auto-replies are disabled.",
-            )
-
-            log.info(
-                "AI disabled: guild_id=%s",
-                interaction.guild.id,
+                ephemeral=True,
             )
 
         except Exception:
-            log.exception("Failed to disable AI")
+            log.exception("Could not disable AI")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to disable AI. Please check the bot logs.",
+            await interaction.followup.send(
+                "Could not disable AI auto-replies.",
+                ephemeral=True,
             )
-
-    # --------------------------------------------------
-    # AI personality
-    # --------------------------------------------------
 
     @ai.command(
         name="prompt",
@@ -307,28 +309,22 @@ class AIChat(commands.Cog):
     ) -> None:
 
         try:
-            # Modal must be the first response.
             settings = await self.bot.db.get_guild_settings(
                 interaction.guild.id
             )
 
             await interaction.response.send_modal(
-                AIPromptModal(
-                    settings.get("ai_prompt") or ""
-                )
+                AIPromptModal(settings.get("ai_prompt") or "")
             )
 
         except Exception:
-            log.exception("Failed to open AI personality modal")
+            log.exception("Could not open AI personality form")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to open AI personality settings.",
-            )
-
-    # --------------------------------------------------
-    # AI status
-    # --------------------------------------------------
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Could not load the AI personality settings.",
+                    ephemeral=True,
+                )
 
     @ai.command(
         name="status",
@@ -341,29 +337,28 @@ class AIChat(commands.Cog):
         interaction: discord.Interaction,
     ) -> None:
 
-        try:
-            await defer_interaction(interaction)
+        await interaction.response.defer(ephemeral=True)
 
+        try:
             settings = await self.bot.db.get_guild_settings(
                 interaction.guild.id
             )
 
             channel_id = settings.get("ai_channel_id")
-
-            if channel_id:
-                channel = interaction.guild.get_channel(channel_id)
-
-                channel_display = (
-                    channel.mention
-                    if channel
-                    else f"<#{channel_id}>"
-                )
-            else:
-                channel_display = "Not configured"
+            channel = (
+                interaction.guild.get_channel(channel_id)
+                if channel_id
+                else None
+            )
 
             prompt_preview = (
-                (settings.get("ai_prompt") or "")
-                .replace("\n", " ")[:160]
+                settings.get("ai_prompt") or ""
+            ).replace("\n", " ")[:160]
+
+            key_status = (
+                "Configured"
+                if self.bot.ai_client
+                else "Missing"
             )
 
             embed = discord.Embed(
@@ -373,23 +368,25 @@ class AIChat(commands.Cog):
 
             embed.add_field(
                 name="AI Channel",
-                value=channel_display,
+                value=channel.mention if channel else "Not configured",
                 inline=False,
             )
 
             embed.add_field(
                 name="API Key",
-                value=(
-                    "Configured"
-                    if self.bot.ai_client
-                    else "Missing"
-                ),
+                value=key_status,
                 inline=True,
             )
 
             embed.add_field(
-                name="Model",
-                value=str(self.bot.ai_model)[:256],
+                name="Text Model",
+                value=self.bot.ai_model,
+                inline=True,
+            )
+
+            embed.add_field(
+                name="Vision Model",
+                value=self.vision_model,
                 inline=True,
             )
 
@@ -399,22 +396,18 @@ class AIChat(commands.Cog):
                 inline=False,
             )
 
-            await send_interaction_message(
-                interaction,
+            await interaction.followup.send(
                 embed=embed,
+                ephemeral=True,
             )
 
         except Exception:
-            log.exception("Failed to retrieve AI configuration")
+            log.exception("Could not load AI status")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to retrieve AI configuration.",
+            await interaction.followup.send(
+                "Could not load AI status.",
+                ephemeral=True,
             )
-
-    # --------------------------------------------------
-    # Clear history
-    # --------------------------------------------------
 
     @ai.command(
         name="clear-history",
@@ -427,30 +420,26 @@ class AIChat(commands.Cog):
         interaction: discord.Interaction,
     ) -> None:
 
-        try:
-            await defer_interaction(interaction)
+        await interaction.response.defer(ephemeral=True)
 
+        try:
             await self.bot.db.clear_ai_history(
                 interaction.guild.id,
                 interaction.channel_id,
             )
 
-            await send_interaction_message(
-                interaction,
+            await interaction.followup.send(
                 "AI conversation history cleared for this channel.",
+                ephemeral=True,
             )
 
         except Exception:
-            log.exception("Failed to clear AI conversation history")
+            log.exception("Could not clear AI history")
 
-            await send_interaction_error(
-                interaction,
-                "Failed to clear conversation history. Please check the bot logs.",
+            await interaction.followup.send(
+                "Could not clear AI conversation history.",
+                ephemeral=True,
             )
-
-    # --------------------------------------------------
-    # AI automatic replies
-    # --------------------------------------------------
 
     @commands.Cog.listener()
     async def on_message(
@@ -458,15 +447,22 @@ class AIChat(commands.Cog):
         message: discord.Message,
     ) -> None:
 
+        # 忽略私訊、機器人訊息及非一般文字頻道
         if (
             message.guild is None
             or message.author.bot
-            or not message.content
-            or not message.content.strip()
+            or not isinstance(message.channel, discord.TextChannel)
         ):
             return
 
-        if not isinstance(message.channel, discord.TextChannel):
+        image_attachments = [
+            attachment
+            for attachment in message.attachments
+            if is_image_attachment(attachment)
+        ]
+
+        # 文字和圖片都沒有，就不處理
+        if not message.content.strip() and not image_attachments:
             return
 
         try:
@@ -474,17 +470,17 @@ class AIChat(commands.Cog):
                 message.guild.id
             )
 
-            configured_channel_id = settings.get("ai_channel_id")
+            ai_channel_id = settings.get("ai_channel_id")
 
-            if not configured_channel_id:
+            if not ai_channel_id:
                 return
 
-            if message.channel.id != configured_channel_id:
+            if message.channel.id != ai_channel_id:
                 return
 
             if self.bot.ai_client is None:
                 log.error(
-                    "AI is enabled but AI_API_KEY is missing."
+                    "AI channel is enabled but AI_API_KEY is not configured."
                 )
                 return
 
@@ -496,105 +492,157 @@ class AIChat(commands.Cog):
                     limit=self.bot.ai_history_limit,
                 )
 
-                system_prompt = (
-                    settings.get("ai_prompt")
-                    or (
-                        "You are a helpful Discord server assistant. "
-                        "Reply clearly and politely."
-                    )
-                )
-
+                # 保留原本的文字對話記憶
                 messages = [
                     {
                         "role": "system",
-                        "content": system_prompt,
+                        "content": settings.get("ai_prompt")
+                        or "You are a helpful assistant.",
                     }
                 ]
 
                 messages.extend(history)
 
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": message.content[:6000],
-                    }
-                )
+                user_text = message.content.strip()
 
-                async with message.channel.typing():
-
-                    completion = (
-                        await self.bot.ai_client.chat.completions.create(
-                            model=self.bot.ai_model,
-                            messages=messages,
-                            max_tokens=self.bot.ai_max_tokens,
+                # 有圖片時，下載附件並建立 Vision 輸入
+                if image_attachments:
+                    try:
+                        image_parts, filenames = await build_image_content(
+                            image_attachments
                         )
-                    )
 
-                answer = (
-                    completion.choices[0].message.content or ""
-                ).strip()
+                    except ValueError as exc:
+                        await message.reply(
+                            str(exc),
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        return
 
-                if not answer:
-                    answer = (
-                        "I could not generate a response. Please try again."
-                    )
+                    except Exception:
+                        log.exception("Could not download image attachments")
 
-                await self.bot.db.add_ai_history(
-                    message.guild.id,
-                    message.channel.id,
-                    "user",
-                    message.content[:6000],
-                )
+                        await message.reply(
+                            "I could not read the attached image. Please try again.",
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        return
 
-                await self.bot.db.add_ai_history(
-                    message.guild.id,
-                    message.channel.id,
-                    "assistant",
-                    answer[:6000],
-                )
+                    if not user_text:
+                        user_text = "Please analyze the attached image(s) and describe what you can see."
 
-                chunks = [
-                    answer[index:index + 1900]
-                    for index in range(0, len(answer), 1900)
-                ]
-
-                if not chunks:
-                    chunks = [
-                        "I could not generate a response. Please try again."
+                    # 圖片和文字放在同一個 user message
+                    user_content = [
+                        {
+                            "type": "text",
+                            "text": user_text[:6000],
+                        }
                     ]
 
-                await message.reply(
-                    chunks[0],
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                    user_content.extend(image_parts)
 
-                for chunk in chunks[1:]:
-                    await message.channel.send(
-                        chunk,
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": user_content,
+                        }
+                    )
+
+                    selected_model = self.vision_model
+
+                    # 資料庫只儲存文字，不儲存圖片的 Base64 內容
+                    history_user_text = (
+                        user_text[:5000]
+                        + "\n[Attached image(s): "
+                        + ", ".join(filenames)
+                        + "]"
+                    )
+
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": message.content[:6000],
+                        }
+                    )
+
+                    selected_model = self.bot.ai_model
+                    history_user_text = message.content[:6000]
+
+                try:
+                    async with message.channel.typing():
+
+                        request_options = {
+                            "model": selected_model,
+                            "messages": messages,
+                        }
+
+                        if image_attachments:
+                            request_options["max_completion_tokens"] = (
+                                self.bot.ai_max_tokens
+                            )
+                        else:
+                            request_options["max_tokens"] = (
+                                self.bot.ai_max_tokens
+                            )
+
+                        completion = await self.bot.ai_client.chat.completions.create(
+                            **request_options
+                        )
+
+                    answer = (
+                        completion.choices[0].message.content or ""
+                    ).strip()
+
+                    if not answer:
+                        answer = (
+                            "I could not generate a response. Please try again."
+                        )
+
+                    # 儲存文字形式的歷史，不儲存圖片資料
+                    await self.bot.db.add_ai_history(
+                        message.guild.id,
+                        message.channel.id,
+                        "user",
+                        history_user_text[:6000],
+                    )
+
+                    await self.bot.db.add_ai_history(
+                        message.guild.id,
+                        message.channel.id,
+                        "assistant",
+                        answer[:6000],
+                    )
+
+                    await message.reply(
+                        answer[:1900],
+                        mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
 
+                except Exception:
+                    log.exception(
+                        "AI response failed in channel %s",
+                        message.channel.id,
+                    )
+
+                    try:
+                        await message.reply(
+                            "I'm temporarily unable to respond. Please try again later.",
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except discord.HTTPException:
+                        pass
+
         except Exception:
             log.exception(
-                "AI response failed: guild_id=%s channel_id=%s",
+                "AI message handler failed in guild %s",
                 message.guild.id,
-                message.channel.id,
             )
 
-            try:
-                await message.reply(
-                    "I'm temporarily unable to respond. Please try again later.",
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            except discord.HTTPException:
-                log.exception("Failed to send AI error message")
-
-
-# ==================================================
-# Extension setup
-# ==================================================
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AIChat(bot))
